@@ -1,0 +1,652 @@
+
+              СЕРВЕР
+const express = require("express");
+const http = require("http");
+const { Server } = require("socket.io");
+const cors = require("cors");
+const jwt = require("jsonwebtoken");
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const server = http.createServer(app);
+
+const io = new Server(server, {
+  cors: { origin: "*" }
+});
+
+const SECRET = "supersecret";
+
+/* ================= ВРЕМЕННАЯ БД ================= */
+
+let users = [];
+let friendRequests = [];
+let friendships = [];
+let messages = [];
+
+/* ================= AUTH MIDDLEWARE ================= */
+
+function auth(req, res, next) {
+  const token = req.headers.authorization;
+  if (!token) return res.status(401).json({ error: "Нет токена" });
+
+  try {
+    const decoded = jwt.verify(token, SECRET);
+    req.user = decoded;
+    next();
+  } catch {
+    res.status(401).json({ error: "Неверный токен" });
+  }
+}
+
+/* ================= REGISTER ================= */
+
+app.post("/api/register", (req, res) => {
+  const { login, password } = req.body;
+
+  if (!login || !password)
+    return res.json({ error: "Заполни поля" });
+
+  if (users.find(u => u.login === login))
+    return res.json({ error: "Пользователь уже существует" });
+
+  const user = {
+    id: Date.now().toString(),
+    login,
+    password,
+    nickname: login
+  };
+
+  users.push(user);
+
+  const token = jwt.sign(user, SECRET);
+  res.json({ token });
+});
+
+/* ================= LOGIN ================= */
+
+app.post("/api/login", (req, res) => {
+  const { login, password } = req.body;
+
+  const user = users.find(
+    u => u.login === login && u.password === password
+  );
+
+  if (!user)
+    return res.json({ error: "Неверные данные" });
+
+  const token = jwt.sign(user, SECRET);
+  res.json({ token });
+});
+
+/* ================= PROFILE ================= */
+
+app.get("/api/profile", auth, (req, res) => {
+  const user = users.find(u => u.id === req.user.id);
+  res.json(user);
+});
+
+app.put("/api/profile", auth, (req, res) => {
+  const user = users.find(u => u.id === req.user.id);
+  user.nickname = req.body.nickname;
+  res.json(user);
+});
+
+/* ================= FRIEND REQUESTS ================= */
+
+app.post("/api/friend-request", auth, (req, res) => {
+  const { login } = req.body;
+
+  const target = users.find(u => u.login === login);
+  if (!target)
+    return res.json({ error: "Пользователь не найден" });
+
+  if (target.id === req.user.id)
+    return res.json({ error: "Нельзя добавить себя" });
+
+  const alreadyFriends = friendships.find(
+    f =>
+      (f.user1 === req.user.id && f.user2 === target.id) ||
+      (f.user1 === target.id && f.user2 === req.user.id)
+  );
+
+  if (alreadyFriends)
+    return res.json({ error: "Вы уже друзья" });
+
+  const existingRequest = friendRequests.find(
+    r => r.from === req.user.id && r.to === target.id
+  );
+
+  if (existingRequest)
+    return res.json({ error: "Заявка уже отправлена" });
+
+  friendRequests.push({
+    from: req.user.id,
+    to: target.id
+  });
+
+  console.log("📩 Новая заявка:", req.user.login, "->", target.login);
+
+  res.json({ message: "Заявка отправлена" });
+});
+
+app.get("/api/friend-requests", auth, (req, res) => {
+  const requests = friendRequests
+    .filter(r => r.to === req.user.id)
+    .map(r => users.find(u => u.id === r.from));
+
+  res.json(requests);
+});
+
+app.post("/api/friend-accept", auth, (req, res) => {
+  const { userId } = req.body;
+
+  friendships.push({
+    user1: req.user.id,
+    user2: userId
+  });
+
+  friendRequests = friendRequests.filter(
+    r => !(r.from === userId && r.to === req.user.id)
+  );
+
+  console.log("🤝 Дружба создана");
+
+  res.json({ message: "Принято" });
+});
+
+app.post("/api/friend-decline", auth, (req, res) => {
+  const { userId } = req.body;
+
+  friendRequests = friendRequests.filter(
+    r => !(r.from === userId && r.to === req.user.id)
+  );
+
+  res.json({ message: "Отклонено" });
+});
+
+app.get("/api/friends", auth, (req, res) => {
+  const friends = friendships
+    .filter(
+      f => f.user1 === req.user.id || f.user2 === req.user.id
+    )
+    .map(f => {
+      const friendId =
+        f.user1 === req.user.id ? f.user2 : f.user1;
+      return users.find(u => u.id === friendId);
+    });
+
+  res.json(friends);
+});
+
+app.post("/api/friend-remove", auth, (req, res) => {
+  const { userId } = req.body;
+
+  friendships = friendships.filter(
+    f =>
+      !(
+        (f.user1 === req.user.id && f.user2 === userId) ||
+        (f.user1 === userId && f.user2 === req.user.id)
+      )
+  );
+
+  console.log("❌ Дружба удалена");
+
+  res.json({ message: "Удалён" });
+});
+
+/* ================= MESSAGES ================= */
+
+app.get("/api/messages/:chatId", auth, (req, res) => {
+  console.log("📥 Запрос сообщений:", req.params.chatId);
+
+  const chatMessages = messages.filter(
+    m => m.chatId === req.params.chatId
+  );
+
+  res.json(chatMessages);
+});
+
+/* ================= SOCKET ================= */
+
+io.on("connection", socket => {
+  console.log("🔌 Socket connected:", socket.id);
+
+  socket.on("sendMessage", data => {
+    console.log("📨 Получено сообщение:", data);
+
+    if (!data.chatId || !data.sender || !data.text) {
+      console.log("⛔ Неверный формат сообщения");
+      return;
+    }
+
+    const message = {
+  id: Date.now().toString(),
+  ...data,
+  timestamp: Date.now()
+};
+
+messages.push(message);
+
+io.emit("newMessage", message);
+
+
+    console.log("📦 Всего сообщений:", messages.length);
+  });
+
+  socket.on("disconnect", () => {
+    console.log("❌ Socket disconnected:", socket.id);
+  });
+});
+
+/* ================= DEBUG ================= */
+
+app.get("/debug", (req, res) => {
+  res.json({
+    users,
+    friendRequests,
+    friendships,
+    messages
+  });
+});
+
+/* ================= START ================= */
+
+server.listen(5000, () => {
+  console.log("🚀 Server running on http://localhost:5000");
+});
+
+
+
+                 ФРОНТ
+
+import { useState, useEffect, useRef } from "react";
+import io from "socket.io-client";
+
+const socket = io("http://localhost:5000");
+const API = "http://localhost:5000";
+
+export default function App() {
+  const [token, setToken] = useState(localStorage.getItem("token"));
+  const [isLogin, setIsLogin] = useState(true);
+  const [login, setLogin] = useState("");
+  const [password, setPassword] = useState("");
+
+  const [profile, setProfile] = useState(null);
+  const [friends, setFriends] = useState([]);
+  const [requests, setRequests] = useState([]);
+
+  const [searchLogin, setSearchLogin] = useState("");
+  const [nickname, setNickname] = useState("");
+
+  const [selectedFriend, setSelectedFriend] = useState(null);
+  const [messages, setMessages] = useState([]);
+  const [text, setText] = useState("");
+
+  const [unreadCounts, setUnreadCounts] = useState({});
+
+  const messagesEndRef = useRef(null);
+
+  /* ================= УВЕДОМЛЕНИЯ ================= */
+
+  useEffect(() => {
+    if (Notification.permission !== "granted") {
+      Notification.requestPermission();
+    }
+  }, []);
+
+  /* ================= AUTH ================= */
+
+  const authUser = async () => {
+    const url = isLogin ? "/api/login" : "/api/register";
+
+    const res = await fetch(API + url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ login, password })
+    });
+
+    const data = await res.json();
+
+    if (data.token) {
+      localStorage.setItem("token", data.token);
+      setToken(data.token);
+    } else alert(data.error);
+  };
+
+  const logout = () => {
+    localStorage.removeItem("token");
+    setToken(null);
+  };
+
+  /* ================= ЗАГРУЗКА ДАННЫХ ================= */
+
+  useEffect(() => {
+    if (!token) return;
+
+    fetch(API + "/api/profile", {
+      headers: { Authorization: token }
+    })
+      .then(r => r.json())
+      .then(data => {
+        setProfile(data);
+        setNickname(data.nickname);
+      });
+
+    fetch(API + "/api/friends", {
+      headers: { Authorization: token }
+    })
+      .then(r => r.json())
+      .then(setFriends);
+
+    fetch(API + "/api/friend-requests", {
+      headers: { Authorization: token }
+    })
+      .then(r => r.json())
+      .then(setRequests);
+  }, [token]);
+
+  /* ================= ДРУЗЬЯ ================= */
+
+  const sendFriendRequest = async () => {
+    await fetch(API + "/api/friend-request", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: token
+      },
+      body: JSON.stringify({ login: searchLogin })
+    });
+
+    setSearchLogin("");
+    alert("Заявка отправлена");
+  };
+
+  const acceptRequest = async (userId) => {
+    await fetch(API + "/api/friend-accept", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: token
+      },
+      body: JSON.stringify({ userId })
+    });
+
+    window.location.reload();
+  };
+
+  const declineRequest = async (userId) => {
+    await fetch(API + "/api/friend-decline", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: token
+      },
+      body: JSON.stringify({ userId })
+    });
+
+    window.location.reload();
+  };
+
+  const removeFriend = async (userId) => {
+    await fetch(API + "/api/friend-remove", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: token
+      },
+      body: JSON.stringify({ userId })
+    });
+
+    window.location.reload();
+  };
+
+  /* ================= ПРОФИЛЬ ================= */
+
+  const updateNickname = async () => {
+    await fetch(API + "/api/profile", {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: token
+      },
+      body: JSON.stringify({ nickname })
+    });
+
+    alert("Ник обновлён");
+  };
+
+  /* ================= ЧАТ ================= */
+
+  const generateChatId = (friendId) => {
+    const ids = [profile.id, friendId].sort();
+    return ids.join("_");
+  };
+
+  const loadMessages = async (friendId) => {
+    setSelectedFriend(friendId);
+
+    const chatId = generateChatId(friendId);
+
+    const res = await fetch(API + "/api/messages/" + chatId, {
+      headers: { Authorization: token }
+    });
+
+    const data = await res.json();
+    setMessages(data);
+
+    // сброс unread
+    setUnreadCounts(prev => ({
+      ...prev,
+      [friendId]: 0
+    }));
+  };
+
+  const sendMessage = () => {
+    if (!text || !selectedFriend) return;
+
+    const chatId = generateChatId(selectedFriend);
+
+    const msg = {
+      chatId,
+      sender: profile.id,
+      text
+    };
+
+    socket.emit("sendMessage", msg);
+    setText("");
+  };
+
+  useEffect(() => {
+    socket.on("newMessage", (msg) => {
+      if (!profile) return;
+
+      const ids = msg.chatId.split("_");
+      const friendId = ids.find(id => id !== profile.id);
+
+      const currentChatId =
+        selectedFriend && generateChatId(selectedFriend);
+
+      if (msg.chatId === currentChatId) {
+        setMessages(prev => [...prev, msg]);
+      } else if (msg.sender !== profile.id) {
+        setUnreadCounts(prev => ({
+          ...prev,
+          [friendId]: (prev[friendId] || 0) + 1
+        }));
+
+        if (Notification.permission === "granted") {
+          new Notification("Новое сообщение", {
+            body: msg.text
+          });
+        }
+      }
+    });
+
+    return () => socket.off("newMessage");
+  }, [selectedFriend, profile]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  /* ================= UI ================= */
+
+  if (!token)
+    return (
+      <div style={styles.authContainer}>
+        <div style={styles.authBox}>
+          <h2>{isLogin ? "Вход" : "Регистрация"}</h2>
+          <input style={styles.input} placeholder="Логин" onChange={(e) => setLogin(e.target.value)} />
+          <input style={styles.input} type="password" placeholder="Пароль" onChange={(e) => setPassword(e.target.value)} />
+          <button style={styles.button} onClick={authUser}>
+            {isLogin ? "Войти" : "Зарегистрироваться"}
+          </button>
+          <p style={{ cursor: "pointer" }} onClick={() => setIsLogin(!isLogin)}>
+            {isLogin ? "Нет аккаунта?" : "Уже есть аккаунт?"}
+          </p>
+        </div>
+      </div>
+    );
+
+  return (
+    <div style={styles.container}>
+      <div style={styles.sidebar}>
+        <h3>{profile?.nickname}</h3>
+
+        <input style={styles.input} value={nickname} onChange={(e) => setNickname(e.target.value)} />
+        <button style={styles.smallButton} onClick={updateNickname}>Сменить ник</button>
+
+        <hr />
+
+        <input
+          style={styles.input}
+          placeholder="Логин пользователя"
+          value={searchLogin}
+          onChange={(e) => setSearchLogin(e.target.value)}
+        />
+        <button style={styles.smallButton} onClick={sendFriendRequest}>
+          Добавить в друзья
+        </button>
+
+        <h4>Заявки</h4>
+        {requests.map(r => (
+          <div key={r.id}>
+            {r.nickname}
+            <button onClick={() => acceptRequest(r.id)}>✔</button>
+            <button onClick={() => declineRequest(r.id)}>✖</button>
+          </div>
+        ))}
+
+        <h4>Друзья</h4>
+        {friends.map(f => (
+          <FriendItem
+            key={f.id}
+            friend={f}
+            loadMessages={loadMessages}
+            removeFriend={removeFriend}
+            unreadCount={unreadCounts[f.id] || 0}
+          />
+        ))}
+
+        <button style={styles.logout} onClick={logout}>Выйти</button>
+      </div>
+
+      <div style={styles.chat}>
+        <div style={styles.messages}>
+          {messages.map((m, i) => (
+            <div
+              key={i}
+              style={{
+                ...styles.message,
+                alignSelf: m.sender === profile.id ? "flex-end" : "flex-start"
+              }}
+            >
+              {m.text}
+            </div>
+          ))}
+          <div ref={messagesEndRef} />
+        </div>
+
+        {selectedFriend && (
+          <div style={styles.inputRow}>
+            <input
+              style={styles.chatInput}
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && sendMessage()}
+            />
+            <button style={styles.button} onClick={sendMessage}>Отправить</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ================= КОМПОНЕНТ ДРУГА ================= */
+
+function FriendItem({ friend, loadMessages, removeFriend, unreadCount }) {
+  const [open, setOpen] = useState(false);
+
+  const handleDelete = () => {
+    if (window.confirm("Точно хотите удалить друга?")) {
+      removeFriend(friend.id);
+    }
+  };
+
+  return (
+    <div style={friendStyles.container}>
+      <div style={friendStyles.name} onClick={() => loadMessages(friend.id)}>
+        {friend.nickname}
+        {unreadCount > 0 && (
+          <span style={friendStyles.badge}>{unreadCount}</span>
+        )}
+      </div>
+
+      <div style={{ position: "relative" }}>
+        <div style={friendStyles.menuButton} onClick={() => setOpen(!open)}>
+          ⋮
+        </div>
+
+        {open && (
+          <div style={friendStyles.menu}>
+            <button style={friendStyles.deleteButton} onClick={handleDelete}>
+              Удалить друга
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ================= СТИЛИ ================= */
+
+const styles = {
+  container: { display: "flex", height: "100vh", background: "#0f172a", color: "white" },
+  sidebar: { width: 280, padding: 20, background: "#1e293b", overflowY: "auto" },
+  chat: { flex: 1, display: "flex", flexDirection: "column", padding: 20 },
+  messages: { flex: 1, display: "flex", flexDirection: "column", gap: 10, overflowY: "auto" },
+  message: { padding: 10, background: "#334155", borderRadius: 10, maxWidth: "60%" },
+  inputRow: { display: "flex", gap: 10 },
+  chatInput: { flex: 1, padding: 10, borderRadius: 8, border: "none" },
+  input: { width: "100%", padding: 8, marginBottom: 8, borderRadius: 6, border: "none" },
+  button: { padding: 10, borderRadius: 8, border: "none", background: "#6366f1", color: "white", cursor: "pointer" },
+  smallButton: { padding: 6, borderRadius: 6, border: "none", background: "#475569", color: "white", marginBottom: 8, cursor: "pointer" },
+  logout: { marginTop: 20, padding: 8, borderRadius: 6, border: "none", background: "#ef4444", color: "white", cursor: "pointer" },
+  authContainer: { height: "100vh", display: "flex", justifyContent: "center", alignItems: "center", background: "#0f172a" },
+  authBox: { background: "#1e293b", padding: 30, borderRadius: 12, width: 300 }
+};
+
+const friendStyles = {
+  container: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", position: "relative" },
+  name: { cursor: "pointer", display: "flex", alignItems: "center", gap: 8 },
+  menuButton: { cursor: "pointer", padding: "0 6px", fontSize: 18 },
+  menu: { position: "absolute", right: 0, top: 25, background: "#1e293b", borderRadius: 8, padding: 8, zIndex: 10 },
+  deleteButton: { background: "#ef4444", border: "none", color: "white", padding: "6px 10px", borderRadius: 6, cursor: "pointer" },
+  badge: { background: "#6366f1", borderRadius: "50%", padding: "4px 8px", fontSize: 12 }
+};
+
+

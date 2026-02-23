@@ -1,0 +1,22 @@
+сервер
+cd Desktop\naleistogramm-server
+node server.js
+негрок
+ngrok http 5000
+
+dist
+cd C:\Users\1\naleistogramm
+npm run build
+
+cd C:\Users\1\naleistogramm-client
+npm run dev
+
+
+если сайт выдал белый экран
+localStorage.clear()
+
+
+
+
+
+
